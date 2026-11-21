@@ -7,25 +7,78 @@
 #include "mmid.cuh"
 
 // Upstream's ids helper sorts the assignments by expert but does not return the
-// per-expert counts the GEMM tiles need, so build the prefix sum here.
+// per-expert counts the GEMM tiles need, so build the prefix sum here. The counts
+// live in LDS: a global scan is one dependent load per expert, ~60 us at 256 experts.
 static __global__ void repack_expert_bounds(const int32_t * __restrict__ ids,
         int32_t * __restrict__ bounds, const int n_expert, const int n_tokens,
         const int n_expert_used, const int si1) {
+    extern __shared__ int cnt[];
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
-        bounds[e + 1] = 0;
+        cnt[e] = 0;
     }
     __syncthreads();
     const int n_assign = n_tokens * n_expert_used;
     for (int i = threadIdx.x; i < n_assign; i += blockDim.x) {
         const int e = ids[(i / n_expert_used) * si1 + (i % n_expert_used)];
-        atomicAdd(&bounds[e + 1], 1);
+        atomicAdd(&cnt[e], 1);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        int acc = 0;
         bounds[0] = 0;
         for (int e = 0; e < n_expert; e++) {
-            bounds[e + 1] += bounds[e];
+            acc += cnt[e];
+            bounds[e + 1] = acc;
         }
+    }
+}
+
+// MoE GEMM launch for one tile width. CW < 64 uses the narrow kernel; CW = 64
+// uses the shared 64-wide kernel (BN = 64 * TN).
+template <bool HAS_IDS, int CW, int TN, int NRL, ggml_type WT>
+static void repack_gemm_launch_t(cudaStream_t stream,
+        const uint8_t * w, const block_q8_1 * xq, float * y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
+        const int32_t * ids_src1, const int32_t * ids_dst,
+        const int32_t * expert_bounds, const int32_t * tile_off,
+        const repack_tile_meta * tile_meta,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
+        const int64_t max_tiles) {
+    const dim3 grid((unsigned) ((ne1 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM), (unsigned) max_tiles, 1);
+    const dim3 block(CW, NRL, 1);
+    if constexpr (CW < 64) {
+        mmq_gemm_repacked_narrow<HAS_IDS, CW, TN, NRL, WT><<<grid, block, 0, stream>>>(
+            w, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
+            n_expert, expert_stride, dst_s1);
+    } else {
+        mmq_gemm_repacked<HAS_IDS, TN, NRL, WT><<<grid, block, 0, stream>>>(
+            w, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
+            n_expert, expert_stride, dst_s1);
+    }
+}
+
+template <bool HAS_IDS, int CW, int TN, int NRL>
+static void repack_gemm_launch(const ggml_type type, cudaStream_t stream,
+        const uint8_t * w, const block_q8_1 * xq, float * y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
+        const int32_t * ids_src1, const int32_t * ids_dst,
+        const int32_t * expert_bounds, const int32_t * tile_off,
+        const repack_tile_meta * tile_meta,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
+        const int64_t max_tiles) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_Q8_0>(stream, w, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            break;
+        case GGML_TYPE_Q4_0:
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_Q4_0>(stream, w, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            break;
+        default:
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_IQ4_NL>(stream, w, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            break;
     }
 }
 
@@ -108,8 +161,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), (size_t) n_assign + ne02);
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
         ids_src1.get(), ids_dst.get(), tile_spec.get(),
-        ne02, n_tokens, n_expert_used, nchannels_y, /*tile_width =*/ 1, si1, sis1, false, stream);
-    repack_expert_bounds<<<1, 256, 0, stream>>>(
+        ne02, n_tokens, n_expert_used, nchannels_y, /*tile_width =*/ 1 << 20, si1, sis1, false, stream);
+    repack_expert_bounds<<<1, 256, ne02 * (int) sizeof(int), stream>>>(
         (const int32_t *) ids->data, expert_bounds.get(), ne02, n_tokens, n_expert_used, si1);
     CUDA_CHECK(cudaGetLastError());
 
@@ -121,66 +174,41 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         n_cols, 1, 1, stream);
     const block_q8_1 * xq = (const block_q8_1 *) xq_buf.get();
 
-    constexpr int BN_ID  = 64 * MMQ_RP_Q8_TN;
-    constexpr int BN_W32 = 32;
-    const bool use_w32 = n_assign < 2 * BN_ID * ne02;
+    // Tile width follows the average expert load: a narrow tile at P=512
+    // (n_expert_used * n_tokens / n_expert ~= 16) does not spend half its MACs on
+    // empty columns, a wider one at long prompts does not read the expert weights twice.
+    const int64_t avg = (n_assign + ne02 - 1) / ne02;
+    const int     BN  = avg <= 32 ? 32 : avg <= 64 ? 64 : 64 * MMQ_RP_Q8_TN;
+
+    const int64_t max_tiles = n_assign / BN + ne02;
+    ggml_cuda_pool_alloc<int32_t>          tile_off (ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<repack_tile_meta> tile_meta(ctx.pool(), max_tiles);
+    switch (BN) {
+        case 32:  repack_tile_off<32 ><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
+        case 64:  repack_tile_off<64 ><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
+        default:  repack_tile_off<128><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_IQ4_NL: {
-            if (use_w32) {
-                const int64_t max_tiles = n_assign / BN_W32 + ne02;
-                ggml_cuda_pool_alloc<int32_t>          tile_off (ctx.pool(), ne02 + 1);
-                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta(ctx.pool(), max_tiles);
-                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
-                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
-                switch (src0->type) {
-                    case GGML_TYPE_Q8_0:
-                        mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                    case GGML_TYPE_Q4_0:
-                        mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                    default:
-                        mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                }
-            } else {
-                const int64_t max_tiles = n_assign / BN_ID + ne02;
-                ggml_cuda_pool_alloc<int32_t>          tile_off (ctx.pool(), ne02 + 1);
-                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta(ctx.pool(), max_tiles);
-                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
-                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
-                switch (src0->type) {
-                    case GGML_TYPE_Q8_0:
-                        mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                    case GGML_TYPE_Q4_0:
-                        mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                    default:
-                        mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_IQ4_NL><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
-                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
-                            (uint32_t) ne02, expert_stride, dst_s1);
-                        break;
-                }
+            switch (BN) {
+                case 32:
+                    repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
+                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
+                    break;
+                case 64:
+                    repack_gemm_launch<true, 32, 2, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
+                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
+                    break;
+                default:
+                    repack_gemm_launch<true, 64, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES>(src0->type, stream, w, xq, dst_d,
+                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
+                    break;
             }
         } break;
         default:

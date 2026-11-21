@@ -1243,8 +1243,11 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 #endif
 }
 
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_repacked_w32(
+// Narrow MoE tile. CW is the token-tile lane width and BN = CW * TN_; the tile
+// should cover the average expert load so the columns and the weight stream are
+// not wasted (reinstinct picks 16 for Qwen's 256-expert layers).
+template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void __launch_bounds__(CW * NRL, 3) mmq_gemm_repacked_narrow(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -1253,7 +1256,7 @@ static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_repacked_w32(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else

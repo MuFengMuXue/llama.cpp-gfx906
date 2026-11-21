@@ -295,17 +295,17 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                         (ne11 + bn - 1) / bn, 1);
         switch (src0->type) {
             case GGML_TYPE_Q8_0:
-                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q8_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_Q8_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_IQ4_NL:
-                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
-                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
