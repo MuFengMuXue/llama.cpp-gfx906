@@ -1163,53 +1163,66 @@ static __global__ void mul_mat_vec_repacked_id1(
 
 // Same launch as id1, but routed straight from ids: blockIdx.y is the original
 // (token, slot) entry and the output row; the sort and bounds are GEMM-only.
-template <int ROWS, int NWAVES, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+// HAS_FUSION adds the gate lane and the GLU epilogue, so up and gate share one
+// activation read and one launch.
+template <int ROWS, int NWAVES, int RPL = 1, int LANES = 64, bool HAS_FUSION = false,
+          ggml_type WT = GGML_TYPE_Q8_0>
 static __global__ void mul_mat_vec_repacked_ids(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids, const uint32_t n_expert_used,
         const uint32_t si1, const uint32_t sis1, const uint32_t nchannels_y,
-        const size_t expert_stride, const uint32_t xs, const uint32_t ys) {
+        const size_t expert_stride, const uint32_t xs, const uint32_t ys,
+        const uint8_t * __restrict__ wbase_gate = nullptr,
+        const ggml_glu_op glu_op = GGML_GLU_OP_REGLU) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const uint32_t a    = blockIdx.y;
     const uint32_t tok  = a / n_expert_used;
     const uint32_t slot = a - tok * n_expert_used;
     const uint32_t e    = (uint32_t) ids[(size_t) tok * si1 + slot];
     const uint32_t xrow = tok * sis1 + slot % nchannels_y;
-    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false, LANES, WT>(
+    const uint8_t * wg  = nullptr;
+    if constexpr (HAS_FUSION) {
+        wg = wbase_gate + (size_t) e * expert_stride;
+    } else {
+        GGML_UNUSED_VARS(wbase_gate, glu_op);
+    }
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, HAS_FUSION, LANES, WT>(
         wbase + (size_t) e * expert_stride,
         xq + (size_t) xrow * xs,
         y  + (size_t) a    * ys,
-        ne0, ne1, xs, ys, nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU, 0);
+        ne0, ne1, xs, ys, wg, nullptr, nullptr, glu_op,
+        HAS_FUSION ? (uint32_t) e * ne1 : 0u);
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1,
-                     nchannels_y, expert_stride, xs, ys);
+                     nchannels_y, expert_stride, xs, ys, wbase_gate, glu_op);
     NO_DEVICE_CODE;
 #endif
 }
 
-template <int ROWS, int NWAVES, int RPL, int LANES>
+template <int ROWS, int NWAVES, int RPL, int LANES, bool HAS_FUSION = false>
 static void repack_mmv_ids_launch(
         const ggml_type type, const uint8_t * __restrict__ w, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids, const uint32_t n_expert_used,
         const uint32_t si1, const uint32_t sis1, const uint32_t nchannels_y,
         const size_t expert_stride, const uint32_t xs, const uint32_t ys,
-        const int64_t n_assign, cudaStream_t stream) {
+        const int64_t n_assign, cudaStream_t stream,
+        const uint8_t * w_gate = nullptr, ggml_glu_op glu_op = GGML_GLU_OP_REGLU) {
     const dim3 grid((unsigned) ((ne1 + ROWS - 1) / ROWS), (unsigned) n_assign, 1);
     const dim3 block(NWAVES * 64, 1, 1);
     switch (type) {
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, GGML_TYPE_Q8_0><<<grid, block, 0, stream>>>(
-                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys);
+            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, HAS_FUSION, GGML_TYPE_Q8_0><<<grid, block, 0, stream>>>(
+                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys, w_gate, glu_op);
             break;
         case GGML_TYPE_Q4_0:
-            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, GGML_TYPE_Q4_0><<<grid, block, 0, stream>>>(
-                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys);
+            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, HAS_FUSION, GGML_TYPE_Q4_0><<<grid, block, 0, stream>>>(
+                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys, w_gate, glu_op);
             break;
         default:
-            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, GGML_TYPE_IQ4_NL><<<grid, block, 0, stream>>>(
-                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys);
+            mul_mat_vec_repacked_ids<ROWS, NWAVES, RPL, LANES, HAS_FUSION, GGML_TYPE_IQ4_NL><<<grid, block, 0, stream>>>(
+                w, xq, y, ne0, ne1, ids, n_expert_used, si1, sis1, nchannels_y, expert_stride, xs, ys, w_gate, glu_op);
             break;
     }
 }

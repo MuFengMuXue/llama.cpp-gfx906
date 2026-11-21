@@ -43,6 +43,17 @@ inline void ggml_cuda_mul_mat_id_repacked(
     GGML_ABORT("repacked weights are unavailable on MUSA");
 }
 
+inline bool ggml_cuda_repack_mul_mat_id_fused_supported(
+        const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) {
+    return false;
+}
+
+inline void ggml_cuda_mul_mat_id_repacked_fused(
+        ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+        const ggml_tensor *, ggml_tensor *, ggml_glu_op) {
+    GGML_ABORT("repacked weights are unavailable on MUSA");
+}
+
 #else
 
 bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft);
@@ -68,5 +79,13 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst);
+
+// Fused up/gate/GLU for repacked MoE weights. Only the narrow mat-vec widths.
+bool ggml_cuda_repack_mul_mat_id_fused_supported(
+    const ggml_tensor * src0, const ggml_tensor * gate, const ggml_tensor * ids);
+
+void ggml_cuda_mul_mat_id_repacked_fused(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * gate, ggml_tensor * dst, ggml_glu_op glu_op);
 
 #endif

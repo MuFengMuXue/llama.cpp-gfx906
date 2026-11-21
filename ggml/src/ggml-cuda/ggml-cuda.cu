@@ -5031,6 +5031,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // Repacked MoE weights: fuse up/gate in the repacked mat-vec. The
+            // canonical fused kernels read canonical blocks, so a whole repacked
+            // weight must never reach them.
+            if (ggml_cuda_repack_mul_mat_id_fused_supported(src0, gate->src[0], ids)) {
+                ggml_cuda_mul_mat_id_repacked_fused(*cuda_ctx, src0, src1, ids, gate->src[0], glu,
+                    ggml_get_glu_op(glu));
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];

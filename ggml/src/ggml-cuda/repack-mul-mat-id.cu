@@ -82,9 +82,9 @@ static void repack_gemm_launch(const ggml_type type, cudaStream_t stream,
     }
 }
 
-void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
+static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, const ggml_tensor * gate, ggml_glu_op glu_op) {
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
@@ -112,6 +112,17 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     } else {
         w = (const uint8_t *) src0->data;
     }
+    const uint8_t * w_gate = nullptr;
+    if (gate != nullptr) {
+        GGML_ASSERT(gate->type == src0->type);
+        GGML_ASSERT(dst->ne[0] == ne01);
+        GGML_ASSERT(n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS);
+        if (gate->view_src != nullptr && ggml_cuda_repack_tensor_supported(gate->view_src)) {
+            w_gate = repack_view_get_cached(gate, gate->view_src, stream);
+        } else {
+            w_gate = (const uint8_t *) gate->data;
+        }
+    }
     float * dst_d = (float *) dst->data;
     const size_t expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
@@ -133,25 +144,36 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 
         // Raw routing: the assignment index is (token, slot), so the counting
         // sort and the expert bounds are only needed by the tiled GEMM below.
-        const uint32_t n_blocks = (uint32_t) ne00 >> 5;
-        if (n_blocks <= 8) {
-            repack_mmv_ids_launch<16, 2, 1, 8>(src0->type, w, xq, dst_d,
+        if (gate != nullptr) {
+            // Fused up+gate+GLU: both weights stream through one launch and one
+            // activation read. Geometry follows the traced MoE fusion point.
+            repack_mmv_ids_launch<8, 4, 1, 32, true>(src0->type, w, xq, dst_d,
                 (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
                 (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
-                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
-        } else if (n_blocks <= 16) {
-            repack_mmv_ids_launch<8, 2, 1, 16>(src0->type, w, xq, dst_d,
-                (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
-                (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
-                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream, w_gate, glu_op);
         } else {
-            repack_mmv_ids_launch<4, 2, 2, 64>(src0->type, w, xq, dst_d,
-                (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
-                (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
-                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+            const uint32_t n_blocks = (uint32_t) ne00 >> 5;
+            if (n_blocks <= 8) {
+                repack_mmv_ids_launch<16, 2, 1, 8>(src0->type, w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                    (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                    expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+            } else if (n_blocks <= 16) {
+                repack_mmv_ids_launch<8, 2, 1, 16>(src0->type, w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                    (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                    expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+            } else {
+                repack_mmv_ids_launch<4, 2, 2, 64>(src0->type, w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                    (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                    expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+            }
         }
         return;
     }
+
+    GGML_ASSERT(gate == nullptr);   // the fused epilogue is mat-vec only
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
@@ -214,4 +236,16 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         default:
             GGML_ABORT("unsupported repack type");
     }
+}
+
+void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    mul_mat_id_repacked_impl(ctx, src0, src1, ids, dst, nullptr, GGML_GLU_OP_REGLU);
+}
+
+void ggml_cuda_mul_mat_id_repacked_fused(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * gate, ggml_tensor * dst, ggml_glu_op glu_op) {
+    mul_mat_id_repacked_impl(ctx, src0, src1, ids, dst, gate, glu_op);
 }
