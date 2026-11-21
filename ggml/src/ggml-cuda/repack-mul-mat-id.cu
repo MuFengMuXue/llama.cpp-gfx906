@@ -63,22 +63,9 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const size_t expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-    // upstream's helper always writes its tile spec; the repack GEMM builds its
-    // own tiles, so the buffer is only here to keep the helper happy.
-    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), (size_t) n_assign + ne02);
-    {
-        const int si1  = ids->nb[1] / sizeof(int32_t);
-        const int sis1 = src1->nb[2] / src1->nb[1];
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
-            ids_src1.get(), ids_dst.get(), tile_spec.get(),
-            ne02, n_tokens, n_expert_used, src1->ne[1], /*tile_width =*/ 1, si1, sis1, false, stream);
-        repack_expert_bounds<<<1, 256, 0, stream>>>(
-            (const int32_t *) ids->data, expert_bounds.get(), ne02, n_tokens, n_expert_used, si1);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    const int si1         = ids->nb[1] / sizeof(int32_t);
+    const int sis1        = src1->nb[2] / src1->nb[1];
+    const int nchannels_y = src1->ne[1];
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1;
@@ -91,31 +78,40 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
             (size_t) (n_cols * x_stride), xq_own, stream);
 
-        const dim3 grid((ne01 + 3) / 4, (unsigned) n_assign, 1);
-        switch (src0->type) {
-            case GGML_TYPE_Q8_0:
-                mul_mat_vec_repacked_id1<4, 2, 2><<<grid, 128, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-                    expert_stride, (uint32_t) x_stride, dst_s1);
-                break;
-            case GGML_TYPE_Q4_0:
-                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0><<<grid, 128, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-                    expert_stride, (uint32_t) x_stride, dst_s1);
-                break;
-            case GGML_TYPE_IQ4_NL:
-                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_IQ4_NL><<<grid, 128, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-                    expert_stride, (uint32_t) x_stride, dst_s1);
-                break;
-            default:
-                GGML_ABORT("unsupported repack type");
+        // Raw routing: the assignment index is (token, slot), so the counting
+        // sort and the expert bounds are only needed by the tiled GEMM below.
+        const uint32_t n_blocks = (uint32_t) ne00 >> 5;
+        if (n_blocks <= 8) {
+            repack_mmv_ids_launch<16, 2, 1, 8>(src0->type, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+        } else if (n_blocks <= 16) {
+            repack_mmv_ids_launch<8, 2, 1, 16>(src0->type, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
+        } else {
+            repack_mmv_ids_launch<4, 2, 2, 64>(src0->type, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (const int32_t *) ids->data,
+                (uint32_t) n_expert_used, (uint32_t) si1, (uint32_t) sis1, (uint32_t) nchannels_y,
+                expert_stride, (uint32_t) x_stride, dst_s1, n_assign, stream);
         }
         return;
     }
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
+    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    // upstream's helper always writes its tile spec; the repack GEMM builds its
+    // own tiles, so the buffer is only here to keep the helper happy.
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), (size_t) n_assign + ne02);
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
+        ids_src1.get(), ids_dst.get(), tile_spec.get(),
+        ne02, n_tokens, n_expert_used, nchannels_y, /*tile_width =*/ 1, si1, sis1, false, stream);
+    repack_expert_bounds<<<1, 256, 0, stream>>>(
+        (const int32_t *) ids->data, expert_bounds.get(), ne02, n_tokens, n_expert_used, si1);
+    CUDA_CHECK(cudaGetLastError());
 
     const uint64_t n_groups = (uint64_t) ne10_padded / (4 * QK8_1);
     ggml_cuda_pool_alloc<char> xq_buf(ctx.pool(),
