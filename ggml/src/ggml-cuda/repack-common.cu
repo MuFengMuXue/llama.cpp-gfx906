@@ -45,6 +45,14 @@ bool ggml_cuda_repack_mul_mat_id_fused_supported(
         ggml_cuda_repack_mul_mat_should_fire(src0) && ggml_cuda_repack_mul_mat_should_fire(gate);
 }
 
+// Single-token dense FFN: one activation row, both weights repacked.
+bool ggml_cuda_repack_mul_mat_fused_supported(
+        const ggml_tensor * src0, const ggml_tensor * gate, const ggml_tensor * src1) {
+    return src0 != nullptr && gate != nullptr && src1 != nullptr &&
+        src0->type == gate->type && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_repack_mul_mat_should_fire(src0) && ggml_cuda_repack_mul_mat_should_fire(gate);
+}
+
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
 // [ne1 x nsp]; padding sub-blocks are left zeroed.
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {

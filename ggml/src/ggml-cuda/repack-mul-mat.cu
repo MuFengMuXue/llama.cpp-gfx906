@@ -119,6 +119,72 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     }
 }
 
+// Dense FFN fusion: up and gate share the single activation row, the GLU
+// epilogue writes the result directly.
+void ggml_cuda_mul_mat_repacked_fused(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * gate, ggml_glu_op glu_op) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[1]  == (size_t) dst->ne[0] * sizeof(float));
+    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(gate != nullptr && gate->type == src0->type);
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne10 = src1->ne[0];
+    GGML_ASSERT(ne10 == ne00);
+    GGML_ASSERT(dst->ne[0] == ne01);
+
+    cudaStream_t stream = ctx.stream();
+
+    const uint8_t * w;
+    if (src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src)) {
+        w = repack_view_get_cached(src0, src0->view_src, stream);
+    } else {
+        w = (const uint8_t *) src0->data;
+    }
+    const uint8_t * w_gate;
+    if (gate->view_src != nullptr && ggml_cuda_repack_tensor_supported(gate->view_src)) {
+        w_gate = repack_view_get_cached(gate, gate->view_src, stream);
+    } else {
+        w_gate = (const uint8_t *) gate->data;
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t x_stride    = ne10_padded / QK8_1;
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    const int64_t s12 = src1->nb[2] / sizeof(float);
+    const int64_t s13 = src1->nb[3] / sizeof(float);
+
+    ggml_cuda_pool_alloc<block_q8_1> xq_own;
+    block_q8_1 * xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10, ne10_padded,
+        s11, s12, s13, 1, 1, 1, (size_t) x_stride, xq_own, stream);
+
+    float * dst_d = (float *) dst->data;
+    const dim3 grid((ne01 + 15) / 16, 1, 1);
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+            mul_mat_vec_q8_0_repacked<16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                w_gate, nullptr, nullptr, glu_op);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 0, 0, 0, 1, w_gate, nullptr, nullptr, glu_op);
+            break;
+        case GGML_TYPE_Q4_0:
+            mul_mat_vec_rp<GGML_TYPE_Q4_0, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 0, 0, 0, 1, w_gate, nullptr, nullptr, glu_op);
+            break;
+        default: GGML_ABORT("unsupported repack type");
+    }
+}
+
 // Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
 template <ggml_type WT>
 static void ggml_cuda_mul_mat_repacked_nc_t(

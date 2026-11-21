@@ -5041,6 +5041,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+            if (ids == nullptr && ggml_cuda_repack_mul_mat_fused_supported(src0, gate->src[0], src1)) {
+                ggml_cuda_mul_mat_repacked_fused(*cuda_ctx, src0, src1, glu, gate->src[0],
+                    ggml_get_glu_op(glu));
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
